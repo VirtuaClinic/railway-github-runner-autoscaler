@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const (
@@ -85,20 +86,20 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	log.Printf("webhook received: action=%s labels=%v", event.Action, event.WorkflowJob.Labels)
 
 	id := event.WorkflowJob.ID
+	// A scale error must never turn into an HTTP 500: GitHub does not retry
+	// workflow_job deliveries, so a 500 drops the job for good and it wedges
+	// silently. Acknowledge the delivery instead and let the reconcile loop
+	// retry -- the job stays in the queued set with its timestamp.
 	switch event.Action {
 	case "queued":
 		if err := s.scaleUp(r.Context(), id); err != nil {
-			log.Printf("scale up error: %v", err)
-			http.Error(w, "failed to scale up", http.StatusInternalServerError)
-			return
+			log.Printf("[ERROR] scale up (job %d) failed, left queued for reconcile loop: %v", id, err)
 		}
 	case "in_progress":
 		s.markInProgress(id)
 	case "completed":
 		if err := s.scaleDown(r.Context(), id); err != nil {
-			log.Printf("scale down error: %v", err)
-			http.Error(w, "failed to scale down", http.StatusInternalServerError)
-			return
+			log.Printf("[ERROR] scale down (job %d) failed, reconcile loop will correct: %v", id, err)
 		}
 	default:
 		log.Printf("webhook ignored: action=%s not handled", event.Action)
@@ -147,7 +148,9 @@ func (s *Server) markInProgress(id int64) {
 
 func (s *Server) scaleUp(ctx context.Context, id int64) error {
 	s.state.mu.Lock()
-	s.state.queued[id] = struct{}{}
+	if _, ok := s.state.queued[id]; !ok {
+		s.state.queued[id] = time.Now()
+	}
 	total := len(s.state.queued) + len(s.state.inProgress) + len(s.state.completed)
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
@@ -160,30 +163,10 @@ func (s *Server) scaleUp(ctx context.Context, id int64) error {
 		return nil
 	}
 
-	if err := s.setReplicas(ctx, total); err != nil {
+	if err := s.reconcile(ctx, total, inProgress); err != nil {
 		return err
 	}
 	log.Printf("scaled up: replicas=%d (job id=%d, queued=%d inProgress=%d completed=%d)", total, id, queued, inProgress, completed)
-
-	// setReplicas alone is not enough to guarantee a container actually
-	// exists -- confirmed live, issue #858: requesting the same replica
-	// count Railway already has declared (the common single-job case, 1
-	// staying 1) succeeds with no error but never triggers real
-	// infrastructure reconciliation, leaving the ephemeral runner's exited
-	// container never replaced. Force a genuine redeploy of the runner's
-	// latest deployment to guarantee a real instance is running.
-	//
-	// Only when inProgress==0: redeploying while another job is actually
-	// mid-execution on this service would kill it. When inProgress>0 a
-	// real container is already known to be alive (it's running that
-	// job), and setReplicas above already requested a genuinely higher
-	// count for the concurrent case, which is a real value change and
-	// should reconcile normally.
-	if inProgress == 0 {
-		if err := s.ensureRunnerAlive(ctx); err != nil {
-			log.Printf("ensure runner alive error (non-fatal, setReplicas already succeeded): %v", err)
-		}
-	}
 	return nil
 }
 
@@ -206,9 +189,20 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 		return nil
 	}
 
-	next := max(1, min(queued, s.cfg.MaxRunners))
+	next := s.clampReplicas(queued)
 	if err := s.setReplicas(ctx, next); err != nil {
 		return err
+	}
+	// When pending jobs remain, next often equals the count already committed
+	// for the finished batch, so the patch above is a no-op and those jobs would
+	// wedge with no runner; redeploy to start fresh runners for them. With
+	// nothing pending we skip it -- scaleUp starts a runner for the next job.
+	// A redeploy failure is non-fatal: the reconcile loop retries the still
+	// queued jobs, and the completed set below must still be reset.
+	if queued > 0 {
+		if err := s.ensureRunnerAlive(ctx); err != nil {
+			log.Printf("[ERROR] scale down redeploy failed, reconcile loop will recover: %v", err)
+		}
 	}
 
 	// completed jobs are no longer using up inactive replicas we need to count for
@@ -224,13 +218,81 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 	return nil
 }
 
+// clampReplicas bounds a desired replica count to [1, MaxRunners].
+func (s *Server) clampReplicas(n int) int {
+	return max(1, min(n, s.cfg.MaxRunners))
+}
+
+// reconcile commits the desired replica count and, when nothing is in progress,
+// forces a real redeploy so a fresh ephemeral runner always starts. A bare
+// replica patch is a no-op when the committed count is unchanged, so the exited
+// runner would otherwise never respawn (issue #858). The redeploy is skipped
+// while jobs run because it would replace their replicas; in that case the
+// replica count is increasing, which is already a real diff that Railway
+// reconciles by adding a replica.
+func (s *Server) reconcile(ctx context.Context, desired, inProgress int) error {
+	if err := s.setReplicas(ctx, desired); err != nil {
+		return err
+	}
+	if inProgress == 0 {
+		return s.ensureRunnerAlive(ctx)
+	}
+	return nil
+}
+
+// reconcileLoop is the safety net for the silent-wedge paths. On each tick it
+// looks for jobs that have stayed queued past the stuck threshold -- a dropped
+// webhook delivery, a failed scale call, or a genuine no-op wedge -- and forces
+// a redeploy to recover them. Without it, a job that never starts fires no
+// timeout-minutes and no failure() step, so nobody is paged.
+func (s *Server) reconcileLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.cfg.ReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.reconcileStuck(ctx)
+		}
+	}
+}
+
+// reconcileStuck flags and recovers jobs queued longer than the stuck threshold.
+func (s *Server) reconcileStuck(ctx context.Context) {
+	now := time.Now()
+	s.state.mu.Lock()
+	var stuck []int64
+	for id, queuedAt := range s.state.queued {
+		if now.Sub(queuedAt) >= s.cfg.StuckThreshold {
+			stuck = append(stuck, id)
+		}
+	}
+	queued := len(s.state.queued)
+	inProgress := len(s.state.inProgress)
+	s.state.mu.Unlock()
+
+	if len(stuck) == 0 {
+		return
+	}
+
+	// This log is the only signal a wedged job produces, so make it loud.
+	log.Printf("[ALERT] %d self-hosted job(s) queued past %s with no runner (queued=%d inProgress=%d), forcing reconcile: %v",
+		len(stuck), s.cfg.StuckThreshold, queued, inProgress, stuck)
+
+	desired := s.clampReplicas(queued + inProgress)
+	if err := s.reconcile(ctx, desired, inProgress); err != nil {
+		log.Printf("[ERROR] stuck-job reconcile failed: %v", err)
+	}
+}
+
 // setReplicas patches the runner service's desired replica count and commits
 // it in one step -- the same environmentPatchCommit mutation Railway's own
 // CLI uses for `railway scale` (railwayapp/cli's src/commands/scale.rs).
 // Declares intent (so a genuinely higher concurrent-job count provisions
 // additional replicas) but is NOT sufficient on its own to guarantee a
-// container exists -- see ensureRunnerAlive below, which scaleUp always
-// calls alongside this for the common single-replica case.
+// container exists -- see ensureRunnerAlive below, which reconcile calls
+// alongside this whenever no job is in progress.
 //
 // The original serviceInstanceUpdate mutation this replaced only updates
 // Railway's staged config layer, not the actual running instances -- it
@@ -356,7 +418,7 @@ func (s *Server) gqlDo(ctx context.Context, req gqlRequest, out any) error {
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, railwayGQLURL, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.RailwayURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
