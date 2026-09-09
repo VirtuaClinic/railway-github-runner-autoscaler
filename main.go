@@ -27,6 +27,7 @@ type Config struct {
 	RailwayToken  string
 	ServiceID     string
 	EnvironmentID string
+	ProjectID     string
 	MaxRunners    int
 	Port          string
 	RunnerLabels  []string
@@ -93,6 +94,7 @@ func loadConfig() (Config, error) {
 		RailwayToken:  token,
 		ServiceID:     serviceID,
 		EnvironmentID: os.Getenv("RAILWAY_ENVIRONMENT_ID"),
+		ProjectID:     os.Getenv("RAILWAY_PROJECT_ID"),
 		MaxRunners:    maxRunners,
 		Port:          port,
 		RunnerLabels:  labels,

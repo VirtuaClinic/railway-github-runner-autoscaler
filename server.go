@@ -164,6 +164,26 @@ func (s *Server) scaleUp(ctx context.Context, id int64) error {
 		return err
 	}
 	log.Printf("scaled up: replicas=%d (job id=%d, queued=%d inProgress=%d completed=%d)", total, id, queued, inProgress, completed)
+
+	// setReplicas alone is not enough to guarantee a container actually
+	// exists -- confirmed live, issue #858: requesting the same replica
+	// count Railway already has declared (the common single-job case, 1
+	// staying 1) succeeds with no error but never triggers real
+	// infrastructure reconciliation, leaving the ephemeral runner's exited
+	// container never replaced. Force a genuine redeploy of the runner's
+	// latest deployment to guarantee a real instance is running.
+	//
+	// Only when inProgress==0: redeploying while another job is actually
+	// mid-execution on this service would kill it. When inProgress>0 a
+	// real container is already known to be alive (it's running that
+	// job), and setReplicas above already requested a genuinely higher
+	// count for the concurrent case, which is a real value change and
+	// should reconcile normally.
+	if inProgress == 0 {
+		if err := s.ensureRunnerAlive(ctx); err != nil {
+			log.Printf("ensure runner alive error (non-fatal, setReplicas already succeeded): %v", err)
+		}
+	}
 	return nil
 }
 
@@ -207,6 +227,10 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 // setReplicas patches the runner service's desired replica count and commits
 // it in one step -- the same environmentPatchCommit mutation Railway's own
 // CLI uses for `railway scale` (railwayapp/cli's src/commands/scale.rs).
+// Declares intent (so a genuinely higher concurrent-job count provisions
+// additional replicas) but is NOT sufficient on its own to guarantee a
+// container exists -- see ensureRunnerAlive below, which scaleUp always
+// calls alongside this for the common single-replica case.
 //
 // The original serviceInstanceUpdate mutation this replaced only updates
 // Railway's staged config layer, not the actual running instances -- it
@@ -219,6 +243,13 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 // respawn entirely up to Railway's own (separately unreliable, see
 // station.railway.com/questions/restart-policy-don-t-always-work-2624a2b8)
 // restart-on-exit behavior.
+//
+// Switching to environmentPatchCommit alone turned out NOT to fully fix
+// #858 either -- confirmed live, 2026-09-09: a real queued job still sat
+// with no runner for 2.5+ minutes even with this mutation firing
+// successfully, because requesting the SAME replica count (1 staying 1,
+// the common case) still doesn't force reconciliation. Only a genuine
+// redeployDeployment call (see ensureRunnerAlive) actually unstuck it.
 func (s *Server) setReplicas(ctx context.Context, n int) error {
 	const mutation = `
 mutation EnvironmentPatchCommit($environmentId: String!, $patch: EnvironmentConfig!, $commitMessage: String) {
@@ -242,6 +273,80 @@ mutation EnvironmentPatchCommit($environmentId: String!, $patch: EnvironmentConf
 			"patch":         patch,
 			"commitMessage": fmt.Sprintf("autoscaler: scale to %d replica(s)", n),
 		},
+	}, nil)
+}
+
+// ensureRunnerAlive forces a genuine redeploy of the runner service's latest
+// deployment -- the same deploymentRedeploy mutation Railway's own CLI uses
+// for `railway redeploy` (railwayapp/cli's src/commands/redeploy.rs), fed by
+// the same `deployments` query the CLI uses to resolve which deployment ID
+// that is. Unlike setReplicas, this is a real infrastructure action, not a
+// declarative config patch, so it reconciles even when nothing about the
+// desired state numerically changed. Caller (scaleUp) only invokes this when
+// no job is currently in_progress, since redeploying would kill one that is.
+func (s *Server) ensureRunnerAlive(ctx context.Context) error {
+	id, canRedeploy, err := s.latestRunnerDeployment(ctx)
+	if err != nil {
+		return fmt.Errorf("fetch latest runner deployment: %w", err)
+	}
+	if !canRedeploy {
+		log.Printf("skipping redeploy: latest runner deployment %s is not currently redeployable (building/deploying/removed)", id)
+		return nil
+	}
+	if err := s.redeployDeployment(ctx, id); err != nil {
+		return fmt.Errorf("redeploy deployment %s: %w", id, err)
+	}
+	log.Printf("ensured runner alive: redeployed latest deployment %s", id)
+	return nil
+}
+
+func (s *Server) latestRunnerDeployment(ctx context.Context) (id string, canRedeploy bool, err error) {
+	const query = `
+query Deployments($input: DeploymentListInput!, $first: Int) {
+  deployments(input: $input, first: $first) {
+    edges { node { id status canRedeploy } }
+  }
+}`
+	var out struct {
+		Deployments struct {
+			Edges []struct {
+				Node struct {
+					ID          string `json:"id"`
+					Status      string `json:"status"`
+					CanRedeploy bool   `json:"canRedeploy"`
+				} `json:"node"`
+			} `json:"edges"`
+		} `json:"deployments"`
+	}
+	err = s.gqlDo(ctx, gqlRequest{
+		Query: query,
+		Variables: map[string]any{
+			"input": map[string]any{
+				"projectId":     s.cfg.ProjectID,
+				"environmentId": s.cfg.EnvironmentID,
+				"serviceId":     s.cfg.ServiceID,
+			},
+			"first": 1,
+		},
+	}, &out)
+	if err != nil {
+		return "", false, err
+	}
+	if len(out.Deployments.Edges) == 0 {
+		return "", false, fmt.Errorf("no deployments found for service %s", s.cfg.ServiceID)
+	}
+	node := out.Deployments.Edges[0].Node
+	return node.ID, node.CanRedeploy, nil
+}
+
+func (s *Server) redeployDeployment(ctx context.Context, deploymentID string) error {
+	const mutation = `
+mutation DeploymentRedeploy($id: String!) {
+  deploymentRedeploy(id: $id) { id }
+}`
+	return s.gqlDo(ctx, gqlRequest{
+		Query:     mutation,
+		Variables: map[string]any{"id": deploymentID},
 	}, nil)
 }
 
