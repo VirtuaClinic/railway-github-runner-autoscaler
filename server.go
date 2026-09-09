@@ -154,11 +154,6 @@ func (s *Server) scaleUp(ctx context.Context, id int64) error {
 	completed := len(s.state.completed)
 	s.state.mu.Unlock()
 
-	if total == 1 {
-		log.Printf("scaled up: replicas=1 (base replica handles first job, id=%d)", id)
-		return nil
-	}
-
 	if total > s.cfg.MaxRunners {
 		log.Printf("at max runners (%d), job %d queued and waiting (queued=%d inProgress=%d completed=%d)",
 			s.cfg.MaxRunners, id, queued, inProgress, completed)
@@ -174,6 +169,11 @@ func (s *Server) scaleUp(ctx context.Context, id int64) error {
 
 func (s *Server) scaleDown(ctx context.Context, id int64) error {
 	s.state.mu.Lock()
+	// A job cancelled while still queued (never reached in_progress, so
+	// never went through markInProgress's delete) would otherwise leave a
+	// permanent stale entry here, inflating every future total/next
+	// calculation for the life of this process.
+	delete(s.state.queued, id)
 	delete(s.state.inProgress, id)
 	s.state.completed[id] = struct{}{}
 	queued := len(s.state.queued)
@@ -204,17 +204,43 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 	return nil
 }
 
+// setReplicas patches the runner service's desired replica count and commits
+// it in one step -- the same environmentPatchCommit mutation Railway's own
+// CLI uses for `railway scale` (railwayapp/cli's src/commands/scale.rs).
+//
+// The original serviceInstanceUpdate mutation this replaced only updates
+// Railway's staged config layer, not the actual running instances -- it
+// reports success and even updates the dashboard UI, but never triggers
+// real infrastructure reconciliation (confirmed via Railway's own community
+// support forum: https://station.railway.com/questions/service-instance-update-with-multi-region-co-d7c0d260,
+// "Config accepted... NOT... Infrastructure reconciled"). That's the root
+// cause of issue #858: every prior scale call here looked successful but
+// may never have actually done anything, leaving the ephemeral runner's
+// respawn entirely up to Railway's own (separately unreliable, see
+// station.railway.com/questions/restart-policy-don-t-always-work-2624a2b8)
+// restart-on-exit behavior.
 func (s *Server) setReplicas(ctx context.Context, n int) error {
 	const mutation = `
-mutation UpdateReplicas($serviceId: String!, $environmentId: String!, $input: ServiceInstanceUpdateInput!) {
-  serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId, input: $input)
+mutation EnvironmentPatchCommit($environmentId: String!, $patch: EnvironmentConfig!, $commitMessage: String) {
+  environmentPatchCommit(environmentId: $environmentId, patch: $patch, commitMessage: $commitMessage)
 }`
+	patch := map[string]any{
+		"services": map[string]any{
+			s.cfg.ServiceID: map[string]any{
+				"deploy": map[string]any{
+					"multiRegionConfig": map[string]any{
+						s.cfg.Region: map[string]any{"numReplicas": n},
+					},
+				},
+			},
+		},
+	}
 	return s.gqlDo(ctx, gqlRequest{
 		Query: mutation,
 		Variables: map[string]any{
-			"serviceId":     s.cfg.ServiceID,
 			"environmentId": s.cfg.EnvironmentID,
-			"input":         map[string]any{"numReplicas": n},
+			"patch":         patch,
+			"commitMessage": fmt.Sprintf("autoscaler: scale to %d replica(s)", n),
 		},
 	}, nil)
 }

@@ -14,6 +14,12 @@ const (
 	defaultMaxRunners  = 3
 	defaultPort        = "8080"
 	defaultRunnerLabel = "self-hosted,railway"
+	// Railway's multiRegionConfig keys the desired replica count per
+	// region -- must match the region the runner service actually deploys
+	// to, or environmentPatchCommit silently patches a region with no
+	// instances in it. Override via RAILWAY_REGION_ID if that ever
+	// changes; see RAILWAY_REGION_ID in loadConfig.
+	defaultRegion = "us-east4-eqdc4a"
 )
 
 type Config struct {
@@ -24,6 +30,7 @@ type Config struct {
 	MaxRunners    int
 	Port          string
 	RunnerLabels  []string
+	Region        string
 }
 
 type State struct {
@@ -76,6 +83,11 @@ func loadConfig() (Config, error) {
 		labels[i] = strings.TrimSpace(strings.ToLower(l))
 	}
 
+	region := os.Getenv("RAILWAY_REGION_ID")
+	if region == "" {
+		region = defaultRegion
+	}
+
 	return Config{
 		WebhookSecret: secret,
 		RailwayToken:  token,
@@ -84,6 +96,7 @@ func loadConfig() (Config, error) {
 		MaxRunners:    maxRunners,
 		Port:          port,
 		RunnerLabels:  labels,
+		Region:        region,
 	}, nil
 }
 
@@ -107,8 +120,8 @@ func main() {
 	mux.HandleFunc("/webhook", srv.handleWebhook)
 	mux.HandleFunc("/health", srv.handleHealth)
 
-	log.Printf("starting on :%s | service=%s max=%d labels=%v",
-		cfg.Port, cfg.ServiceID, cfg.MaxRunners, cfg.RunnerLabels)
+	log.Printf("starting on :%s | service=%s region=%s max=%d labels=%v",
+		cfg.Port, cfg.ServiceID, cfg.Region, cfg.MaxRunners, cfg.RunnerLabels)
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
