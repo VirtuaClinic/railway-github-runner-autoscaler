@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const (
@@ -170,21 +171,56 @@ func (s *Server) scaleUp(ctx context.Context, id int64) error {
 	// count Railway already has declared (the common single-job case, 1
 	// staying 1) succeeds with no error but never triggers real
 	// infrastructure reconciliation, leaving the ephemeral runner's exited
-	// container never replaced. Force a genuine redeploy of the runner's
-	// latest deployment to guarantee a real instance is running.
+	// container never replaced. A genuine redeploy of the runner's latest
+	// deployment guarantees a real instance is running -- but firing it
+	// synchronously right here, on every queued webhook, is itself a bug
+	// (issue #862): inProgress==0 is the normal state for every fresh job,
+	// not just a wedge, since inProgress only reflects jobs that already
+	// started. That redeploy raced the job's own pickup on the still-live
+	// old container 3/3 times on a single PR merge, and Railway tore the
+	// old container down mid-run once the new one came up.
 	//
-	// Only when inProgress==0: redeploying while another job is actually
-	// mid-execution on this service would kill it. When inProgress>0 a
-	// real container is already known to be alive (it's running that
-	// job), and setReplicas above already requested a genuinely higher
-	// count for the concurrent case, which is a real value change and
-	// should reconcile normally.
+	// Only redeploy if the job is STILL queued after normal pickup time
+	// has elapsed (checkForWedge) -- that's the actual wedge signature from
+	// #858 (originally stuck 28+ minutes), not the ~10-20s happy path.
+	// Skipped entirely when inProgress>0: another job is confirmed running
+	// mid-execution, redeploying would kill it, and setReplicas above
+	// already requested a genuinely higher count for the concurrent case,
+	// which is a real value change and reconciles normally on its own.
 	if inProgress == 0 {
-		if err := s.ensureRunnerAlive(ctx); err != nil {
-			log.Printf("ensure runner alive error (non-fatal, setReplicas already succeeded): %v", err)
-		}
+		go s.checkForWedge(id)
 	}
 	return nil
+}
+
+// checkForWedge waits past normal runner-pickup time, then forces a redeploy
+// only if the job never left the queued state -- i.e. actually wedged. See
+// the issue #862 comment in scaleUp above for why this replaced firing
+// ensureRunnerAlive unconditionally on every queued webhook.
+func (s *Server) checkForWedge(id int64) {
+	time.Sleep(s.cfg.WedgeCheckDelay)
+
+	s.state.mu.Lock()
+	_, stillQueued := s.state.queued[id]
+	inProgress := len(s.state.inProgress)
+	s.state.mu.Unlock()
+
+	if !stillQueued {
+		// Picked up normally (now in_progress) or already completed/cancelled.
+		return
+	}
+	if inProgress > 0 {
+		// Some other job already proved the runner is alive since this
+		// check was scheduled -- redeploying now would kill it.
+		return
+	}
+
+	log.Printf("job %d still queued after %s, treating as wedged (issue #858)", id, s.cfg.WedgeCheckDelay)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.ensureRunnerAlive(ctx); err != nil {
+		log.Printf("ensure runner alive error (non-fatal): %v", err)
+	}
 }
 
 func (s *Server) scaleDown(ctx context.Context, id int64) error {

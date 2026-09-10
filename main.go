@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -20,18 +21,26 @@ const (
 	// instances in it. Override via RAILWAY_REGION_ID if that ever
 	// changes; see RAILWAY_REGION_ID in loadConfig.
 	defaultRegion = "us-east4-eqdc4a"
+	// A brand-new queued job normally reaches in_progress within ~10-20s
+	// (confirmed live, #858). #858's original wedge sat queued 28+ minutes.
+	// This delay must clear the happy path comfortably while still catching
+	// a real wedge quickly -- see checkForWedge in server.go, and issue #862
+	// for why firing on every queued webhook instead of after this delay
+	// took down 3/3 build jobs on a single PR merge.
+	defaultWedgeCheckDelaySeconds = 45
 )
 
 type Config struct {
-	WebhookSecret string
-	RailwayToken  string
-	ServiceID     string
-	EnvironmentID string
-	ProjectID     string
-	MaxRunners    int
-	Port          string
-	RunnerLabels  []string
-	Region        string
+	WebhookSecret   string
+	RailwayToken    string
+	ServiceID       string
+	EnvironmentID   string
+	ProjectID       string
+	MaxRunners      int
+	Port            string
+	RunnerLabels    []string
+	Region          string
+	WedgeCheckDelay time.Duration
 }
 
 type State struct {
@@ -89,16 +98,26 @@ func loadConfig() (Config, error) {
 		region = defaultRegion
 	}
 
+	wedgeCheckDelaySeconds := defaultWedgeCheckDelaySeconds
+	if v := os.Getenv("WEDGE_CHECK_DELAY_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return Config{}, fmt.Errorf("WEDGE_CHECK_DELAY_SECONDS must be a positive integer, got %q", v)
+		}
+		wedgeCheckDelaySeconds = n
+	}
+
 	return Config{
-		WebhookSecret: secret,
-		RailwayToken:  token,
-		ServiceID:     serviceID,
-		EnvironmentID: os.Getenv("RAILWAY_ENVIRONMENT_ID"),
-		ProjectID:     os.Getenv("RAILWAY_PROJECT_ID"),
-		MaxRunners:    maxRunners,
-		Port:          port,
-		RunnerLabels:  labels,
-		Region:        region,
+		WebhookSecret:   secret,
+		RailwayToken:    token,
+		ServiceID:       serviceID,
+		EnvironmentID:   os.Getenv("RAILWAY_ENVIRONMENT_ID"),
+		ProjectID:       os.Getenv("RAILWAY_PROJECT_ID"),
+		MaxRunners:      maxRunners,
+		Port:            port,
+		RunnerLabels:    labels,
+		Region:          region,
+		WedgeCheckDelay: time.Duration(wedgeCheckDelaySeconds) * time.Second,
 	}, nil
 }
 
