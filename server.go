@@ -15,10 +15,10 @@ import (
 	"time"
 )
 
-const (
-	railwayGQLURL = "https://backboard.railway.app/graphql/v2"
-	maxBodyBytes  = 5 * 1024 * 1024 // 5MB
-)
+const maxBodyBytes = 5 * 1024 * 1024 // 5MB
+
+// A var, not a const, only so tests can point it at an httptest server.
+var railwayGQLURL = "https://backboard.railway.app/graphql/v2"
 
 type WorkflowJobEvent struct {
 	Action      string      `json:"action"`
@@ -149,10 +149,27 @@ func (s *Server) markInProgress(id int64) {
 func (s *Server) scaleUp(ctx context.Context, id int64) error {
 	s.state.mu.Lock()
 	s.state.queued[id] = struct{}{}
-	total := len(s.state.queued) + len(s.state.inProgress) + len(s.state.completed)
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
 	completed := len(s.state.completed)
+	total := queued + inProgress + completed
+	// Back-to-back jobs (e.g. build -> e2e): GitHub fires the next job's
+	// `queued` webhook in the same second as the previous job's `completed`,
+	// and the two can be processed in either order. If `queued` wins, the
+	// just-finished job is still in `completed`, so `total` is 2 even though
+	// nothing is running and one runner is all that's needed. That 1 -> 2 is a
+	// genuine replica-count change, so Railway creates a new deployment and
+	// replaces the container the next job has already been picked up on --
+	// killing it ("The runner has received a shutdown signal"). Observed
+	// 2026-10-01 on `e2e` right after `build` on main, log line `scaled up:
+	// replicas=2 (queued=1 inProgress=0 completed=1)` just before each kill.
+	//
+	// `completed` only needs counting while other jobs are still in progress
+	// (their replicas can't be scaled away individually); with nothing running
+	// there is nothing to protect, so ignore it and request just what's queued.
+	if inProgress == 0 {
+		total = queued
+	}
 	s.state.mu.Unlock()
 
 	if total > s.cfg.MaxRunners {
